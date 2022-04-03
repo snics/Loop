@@ -89,6 +89,7 @@ public extension IOBChart {
 
         let layers: [ChartLayer?] = [
             gridLayer,
+            currentTimeLayer,
             xAxisLayer,
             yAxisLayer,
             zeroGuidelineLayer,
