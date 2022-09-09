@@ -138,8 +138,17 @@ final class WatchDataManager: NSObject {
 
         lastSentSettings = settings
 
-        log.default("Transferring LoopSettingsUserInfo")
-        session.transferUserInfo(LoopSettingsUserInfo(settings: settings).rawValue)
+        // clear any old pending settings transfers
+        for transfer in session.outstandingUserInfoTransfers {
+            if (transfer.userInfo["name"] as? String) == LoopSettingsUserInfo.name {
+                log.default("Cancelling old setings transfer")
+                transfer.cancel()
+            }
+        }
+
+        let userInfo = LoopSettingsUserInfo(settings: settings).rawValue
+        log.default("Transferring LoopSettingsUserInfo: %{public}@", userInfo)
+        session.transferUserInfo(userInfo)
     }
 
     @objc private func sendSupportedBolusVolumesIfNeeded() {
@@ -349,6 +358,12 @@ final class WatchDataManager: NSObject {
     private func addCarbEntryAndBolusFromWatchMessage(_ message: [String: Any]) {
         guard let bolus = SetBolusUserInfo(rawValue: message as SetBolusUserInfo.RawValue) else {
             log.error("Could not enact bolus from from unknown message: %{public}@", String(describing: message))
+            return
+        }
+
+        // Prevent any delayed messages from enacting.
+        guard bolus.startDate.timeIntervalSinceNow > -30 else {
+            log.error("Could not enact expired bolus from watch: %{public}@", String(describing: message))
             return
         }
 

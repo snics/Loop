@@ -255,12 +255,12 @@ final class LoopDataManager {
             analyticsServicesManager.didChangeCarbRatioSchedule()
         }
 
-        if newValue.glucoseTargetRangeSchedule?.timeZone != oldValue.glucoseTargetRangeSchedule?.timeZone {
-            analyticsServicesManager.pumpTimeZoneDidChange()
-        }
-
         if newValue.defaultRapidActingModel != oldValue.defaultRapidActingModel {
-            doseStore.insulinModelProvider = PresetInsulinModelProvider(defaultRapidActingModel: newValue.defaultRapidActingModel)
+            if FeatureFlags.adultChildInsulinModelSelectionEnabled {
+                doseStore.insulinModelProvider = PresetInsulinModelProvider(defaultRapidActingModel: newValue.defaultRapidActingModel)
+            } else {
+                doseStore.insulinModelProvider = PresetInsulinModelProvider(defaultRapidActingModel: nil)
+            }
             invalidateCachedEffects = true
             analyticsServicesManager.didChangeInsulinModel()
         }
@@ -552,6 +552,8 @@ extension LoopDataManager {
         }
         self.dosingDecisionStore.storeDosingDecision(dosingDecision) {}
 
+        // Didn't actually run a loop, but this is similar to a loop() in that the automatic dosing
+        // was updated.
         self.notify(forChange: .loopFinished)
         completion?(error)
     }
@@ -2187,6 +2189,7 @@ extension LoopDataManager {
             let settings = settings
             return TherapySettings(glucoseTargetRangeSchedule: settings.glucoseTargetRangeSchedule,
                             correctionRangeOverrides: CorrectionRangeOverrides(preMeal: settings.preMealTargetRange, workout: settings.legacyWorkoutTargetRange),
+                            overridePresets: settings.overridePresets,
                             maximumBasalRatePerHour: settings.maximumBasalRatePerHour,
                             maximumBolus: settings.maximumBolus,
                             suspendThreshold: settings.suspendThreshold,
