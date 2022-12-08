@@ -300,7 +300,9 @@ struct BolusEntryView: View {
     private func didBeginEditing() {
         if !editedBolusAmount {
             enteredBolusString = ""
-            self.viewModel.enteredBolus = HKQuantity(unit: .internationalUnit(), doubleValue: 0)
+            DispatchQueue.main.async {
+                self.viewModel.enteredBolus = HKQuantity(unit: .internationalUnit(), doubleValue: 0)
+            }
             editedBolusAmount = true
         }
     }
@@ -408,7 +410,11 @@ struct BolusEntryView: View {
                 if self.viewModel.actionButtonAction == .enterBolus {
                     self.shouldBolusEntryBecomeFirstResponder = true
                 } else {
-                    self.viewModel.saveAndDeliver(onSuccess: self.dismiss)
+                    Task {
+                        if await self.viewModel.didPressActionButton() {
+                            dismiss()
+                        }
+                    }
                 }
             },
             label: {
@@ -425,7 +431,7 @@ struct BolusEntryView: View {
             }
         )
         .buttonStyle(ActionButtonStyle(viewModel.primaryButton == .actionButton ? .primary : .secondary))
-        .disabled(viewModel.isInitiatingSaveOrBolus)
+        .disabled(viewModel.enacting)
         .padding()
     }
 
@@ -443,6 +449,11 @@ struct BolusEntryView: View {
             return SwiftUI.Alert(
                 title: Text("Exceeds Maximum Bolus", comment: "Alert title for a maximum bolus validation error"),
                 message: Text("The maximum bolus amount is \(maximumBolusAmountString) U.", comment: "Alert message for a maximum bolus validation error (1: max bolus value)")
+            )
+        case .bolusTooSmall:
+            return SwiftUI.Alert(
+                title: Text("Bolus Too Small", comment: "Alert title for a bolus too small validation error"),
+                message: Text("The bolus amount entered is smaller than the minimum deliverable.", comment: "Alert message for a bolus too small validation error")
             )
         case .noPumpManagerConfigured:
             return SwiftUI.Alert(

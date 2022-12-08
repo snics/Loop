@@ -353,7 +353,7 @@ final class DeviceDataManager {
         statusExtensionManager = ExtensionDataManager(deviceDataManager: self, closedLoopStatus: closedLoopStatus)
 
         loopManager = LoopDataManager(
-            lastLoopCompleted: statusExtensionManager.context?.lastLoopCompleted,
+            lastLoopCompleted: ExtensionDataManager.lastLoopCompleted,
             basalDeliveryState: pumpManager?.status.basalDeliveryState,
             settings: settingsManager.loopSettings,
             overrideHistory: overrideHistory,
@@ -513,32 +513,29 @@ final class DeviceDataManager {
         }
     }
 
-    private func processCGMReadingResult(_ manager: CGMManager, readingResult: CGMReadingResult) {
+    private func processCGMReadingResult(_ manager: CGMManager, readingResult: CGMReadingResult, completion: @escaping () -> Void) {
         switch readingResult {
         case .newData(let values):
             log.default("CGMManager:%{public}@ did update with %d values", String(describing: type(of: manager)), values.count)
             loopManager.addGlucoseSamples(values) { result in
-                self.checkPumpDataAndLoop()
                 if !values.isEmpty {
                     DispatchQueue.main.async {
                         self.cgmStalenessMonitor.cgmGlucoseSamplesAvailable(values)
                     }
                 }
+                completion()
             }
         case .unreliableData:
             loopManager.receivedUnreliableCGMReading()
+            completion()
         case .noData:
             log.default("CGMManager:%{public}@ did update with no data", String(describing: type(of: manager)))
-            // Attempt Loop even if this fetch didn't produce new data; a previous fetch may have produced recent-enough data
-            self.checkPumpDataAndLoop()
+            completion()
         case .error(let error):
             log.default("CGMManager:%{public}@ did update with error: %{public}@", String(describing: type(of: manager)), String(describing: error))
-
             self.setLastError(error: error)
-            // Attempt Loop even if this fetch didn't produce new data; a previous fetch may have produced recent-enough data
-            self.checkPumpDataAndLoop()
+            completion()
         }
-
         updatePumpManagerBLEHeartbeatPreference()
     }
 
@@ -789,6 +786,8 @@ extension DeviceDataManager {
                     completion(nil)
                 }
             }
+            // Trigger forecast/recommendation update for remote clients
+            self.loopManager.updateRemoteRecommendation()
         }
     }
 
@@ -916,7 +915,9 @@ extension DeviceDataManager: CGMManagerDelegate {
 
     func cgmManager(_ manager: CGMManager, hasNew readingResult: CGMReadingResult) {
         dispatchPrecondition(condition: .onQueue(queue))
-        processCGMReadingResult(manager, readingResult: readingResult);
+        processCGMReadingResult(manager, readingResult: readingResult) {
+            self.checkPumpDataAndLoop()
+        }
     }
 
     func startDateToFilterNewData(for manager: CGMManager) -> Date? {
@@ -996,8 +997,12 @@ extension DeviceDataManager: PumpManagerDelegate {
             }
 
             self.queue.async {
-                self.processCGMReadingResult(cgmManager, readingResult: result)
-                completion?()
+                self.processCGMReadingResult(cgmManager, readingResult: result) {
+                    if self.loopManager.lastLoopCompleted == nil || self.loopManager.lastLoopCompleted!.timeIntervalSinceNow < -.minutes(6) {
+                        self.checkPumpDataAndLoop()
+                    }
+                    completion?()
+                }
             }
         }
     }
@@ -1156,6 +1161,10 @@ extension DeviceDataManager: PumpManagerOnboardingDelegate {
             self.settingsManager.storeSettings()
         }
     }
+
+    func pumpManagerOnboarding(didPauseOnboarding pumpManager: PumpManagerUI) {
+        
+    }
 }
 
 // MARK: - AlertStoreDelegate
@@ -1258,7 +1267,7 @@ extension DeviceDataManager {
 
 // MARK: - LoopDataManagerDelegate
 extension DeviceDataManager: LoopDataManagerDelegate {
-    func loopDataManager(_ manager: LoopDataManager, roundBasalRate unitsPerHour: Double) -> Double {
+    func roundBasalRate(unitsPerHour: Double) -> Double {
         guard let pumpManager = pumpManager else {
             return unitsPerHour
         }
@@ -1266,7 +1275,7 @@ extension DeviceDataManager: LoopDataManagerDelegate {
         return pumpManager.roundToSupportedBasalRate(unitsPerHour: unitsPerHour)
     }
 
-    func loopDataManager(_ manager: LoopDataManager, roundBolusVolume units: Double) -> Double {
+    func roundBolusVolume(units: Double) -> Double {
         guard let pumpManager = pumpManager else {
             return units
         }
@@ -1313,10 +1322,11 @@ extension DeviceDataManager {
     func handleRemoteNotification(_ notification: [String: AnyObject]) {
 
         defer {
-            log.info("Finished handling remote notification")
+            log.default("Remote Notification: Finished handling")
         }
         
         guard FeatureFlags.remoteOverridesEnabled else {
+            log.error("Remote Notification: Overrides not enabled.")
             return
         }
 
@@ -1325,11 +1335,11 @@ extension DeviceDataManager {
             formatter.formatOptions =  [.withInternetDateTime, .withFractionalSeconds]
             if let expiration = formatter.date(from: expirationStr) {
                 guard expiration > Date() else {
-                    log.error("Expired notification: %{public}@", String(describing: notification))
+                    log.error("Remote Notification: Expired: %{public}@", String(describing: notification))
                     return
                 }
             } else {
-                log.error("Invalid expiration: %{public}@", expirationStr)
+                log.error("Remote Notification: Invalid expiration: %{public}@", expirationStr)
                 return
             }
         }
@@ -1337,71 +1347,72 @@ extension DeviceDataManager {
         let command: RemoteCommand
         
         do {
-            command = try RemoteCommand.createRemoteCommand(notification: notification, allowedPresets: loopManager.settings.overridePresets).get()
+            command = try RemoteCommand.createRemoteCommand(notification: notification, allowedPresets: loopManager.settings.overridePresets, defaultAbsorptionTime: carbStore.defaultAbsorptionTimes.medium).get()
         } catch {
-            log.error("Remote Notification Error: %{public}@", String(describing: error))
+            log.error("Remote Notification: Parse Error: %{public}@", String(describing: error))
             return
         }
 
         switch command {
             
         case .temporaryScheduleOverride(let override):
-            log.default("Enacting remote temporary override: %{public}@", String(describing: override))
+            log.default("Remote Notification: Enacting temporary override: %{public}@", String(describing: override))
             loopManager.mutateSettings { settings in settings.scheduleOverride = override }
         case .cancelTemporaryOverride:
-            log.default("Canceling temporary override from remote command")
+            log.default("Remote Notification: Canceling temporary override")
             loopManager.mutateSettings { settings in settings.scheduleOverride = nil }
         case .bolusEntry(let bolusAmount):
-            log.default("Enacting remote bolus entry: %{public}@", String(describing: bolusAmount))
+            log.default("Remote Notification: Enacting bolus entry: %{public}@", String(describing: bolusAmount))
             
             //Remote bolus requires validation from its remote source
             guard remoteDataServicesManager.validatePushNotificationSource(notification) else {
                 NotificationManager.sendRemoteBolusFailureNotification(for: RemoteCommandError.invalidOTP, amount: bolusAmount)
-                log.info("Could not validate notification: %{public}@", String(describing: notification))
+                log.error("Remote Notification: Could not validate notification: %{public}@", String(describing: notification))
                 return
             }
             
             guard let maxBolusAmount = loopManager.settings.maximumBolus else {
                 NotificationManager.sendRemoteBolusFailureNotification(for: RemoteCommandError.missingMaxBolus, amount: bolusAmount)
-                log.default("No max bolus detected. Aborting...")
+                log.error("Remote Notification: No max bolus detected. Aborting...")
                 return
             }
             
             guard bolusAmount.isLessThanOrEqualTo(maxBolusAmount) else {
                 NotificationManager.sendRemoteBolusFailureNotification(for: RemoteCommandError.exceedsMaxBolus, amount: bolusAmount)
-                log.default("Remote bolus higher than maximum. Aborting...")
+                log.error("Remote Notification: Bolus exceeds maximum allowed. Aborting...")
                 return
             }
             
             // For remote boluses, assume manual no recommendation.
             self.enactBolus(units: bolusAmount, activationType: .manualNoRecommendation) { error in
                 if let error = error {
+                    self.log.error("Remote Notification: Error adding bolus: %{public}@", String(describing: error))
                     NotificationManager.sendRemoteBolusFailureNotification(for: error, amount: bolusAmount)
                 } else {
                     NotificationManager.sendRemoteBolusNotification(amount: bolusAmount)
                 }
             }
         case .carbsEntry(let candidateCarbEntry):
-            log.default("Adding carbs entry.")
+            log.default("Remote Notification: Adding carbs entry: %{public}@", String(describing: candidateCarbEntry))
             
             let candidateCarbsInGrams = candidateCarbEntry.quantity.doubleValue(for: .gram())
             
             //Remote carb entry requires validation from its remote source
             guard remoteDataServicesManager.validatePushNotificationSource(notification) else {
                 NotificationManager.sendRemoteCarbEntryFailureNotification(for: RemoteCommandError.invalidOTP, amountInGrams: candidateCarbsInGrams)
-                log.info("Could not validate notification: %{public}@", String(describing: notification))
+                log.error("Remote Notification: Could not validate notification: %{public}@", String(describing: notification))
                 return
             }
             
             guard candidateCarbsInGrams > 0.0 else {
                 NotificationManager.sendRemoteCarbEntryFailureNotification(for: RemoteCommandError.invalidCarbs, amountInGrams: candidateCarbsInGrams)
-                log.default("Invalid carb entry amount. Aborting...")
+                log.error("Remote Notification: Invalid carb entry amount. Aborting...")
                 return
             }
             
             guard candidateCarbsInGrams <= LoopConstants.maxCarbEntryQuantity.doubleValue(for: .gram()) else {
                 NotificationManager.sendRemoteCarbEntryFailureNotification(for: RemoteCommandError.exceedsMaxCarbs, amountInGrams: candidateCarbsInGrams)
-                log.default("Carbs higher than maximum. Aborting...")
+                log.error("Remote Notification: Carbs higher than maximum. Aborting...")
                 return
             }
             
@@ -1410,6 +1421,7 @@ extension DeviceDataManager {
                 case .success(let completedCarbEntry):
                     NotificationManager.sendRemoteCarbEntryNotification(amountInGrams: completedCarbEntry.quantity.doubleValue(for: .gram()))
                 case .failure(let error):
+                    self.log.error("Remote Notification: Error adding carb entry: %{public}@", String(describing: error))
                     NotificationManager.sendRemoteCarbEntryFailureNotification(for: error, amountInGrams: candidateCarbsInGrams)
                 }
             }
@@ -1645,33 +1657,19 @@ extension DeviceDataManager: TherapySettingsViewModelDelegate {
         }
     }
     
-    func saveCompletion(for therapySetting: TherapySetting, therapySettings: TherapySettings) {
-        switch therapySetting {
-        case .glucoseTargetRange:
-            loopManager.mutateSettings { settings in settings.glucoseTargetRangeSchedule = therapySettings.glucoseTargetRangeSchedule }
-        case .preMealCorrectionRangeOverride:
-            loopManager.mutateSettings { settings in settings.preMealTargetRange = therapySettings.correctionRangeOverrides?.preMeal }
-        case .workoutCorrectionRangeOverride:
-            loopManager.mutateSettings { settings in settings.legacyWorkoutTargetRange = therapySettings.correctionRangeOverrides?.workout }
-        case .suspendThreshold:
-            loopManager.mutateSettings { settings in settings.suspendThreshold = therapySettings.suspendThreshold }
-        case .basalRate:
-            loopManager.mutateSettings { settings in settings.basalRateSchedule = therapySettings.basalRateSchedule }
-        case .deliveryLimits:
-            loopManager.mutateSettings { settings in
-                settings.maximumBasalRatePerHour = therapySettings.maximumBasalRatePerHour
-                settings.maximumBolus = therapySettings.maximumBolus
-            }
-        case .insulinModel:
-            if let defaultRapidActingModel = therapySettings.defaultRapidActingModel {
-                loopManager.mutateSettings { settings in settings.defaultRapidActingModel = defaultRapidActingModel }
-            }
-        case .carbRatio:
-            loopManager.mutateSettings { settings in settings.carbRatioSchedule = therapySettings.carbRatioSchedule }
-        case .insulinSensitivity:
-            loopManager.mutateSettings { settings in settings.insulinSensitivitySchedule = therapySettings.insulinSensitivitySchedule }
-        case .none:
-            break // NO-OP
+    func saveCompletion(therapySettings: TherapySettings) {
+
+        loopManager.mutateSettings { settings in
+            settings.glucoseTargetRangeSchedule = therapySettings.glucoseTargetRangeSchedule
+            settings.preMealTargetRange = therapySettings.correctionRangeOverrides?.preMeal
+            settings.legacyWorkoutTargetRange = therapySettings.correctionRangeOverrides?.workout
+            settings.suspendThreshold = therapySettings.suspendThreshold
+            settings.basalRateSchedule = therapySettings.basalRateSchedule
+            settings.maximumBasalRatePerHour = therapySettings.maximumBasalRatePerHour
+            settings.maximumBolus = therapySettings.maximumBolus
+            settings.defaultRapidActingModel = therapySettings.defaultRapidActingModel
+            settings.carbRatioSchedule = therapySettings.carbRatioSchedule
+            settings.insulinSensitivitySchedule = therapySettings.insulinSensitivitySchedule
         }
     }
     
