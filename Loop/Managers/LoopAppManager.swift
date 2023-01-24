@@ -15,6 +15,12 @@ import MockKit
 import HealthKit
 import WidgetKit
 
+#if targetEnvironment(simulator)
+enum SimulatorError: Error {
+    case remoteNotificationsNotAvailable
+}
+#endif
+
 public protocol AlertPresenter: AnyObject {
     /// Present the alert view controller, with or without animation.
     /// - Parameters:
@@ -73,6 +79,9 @@ class LoopAppManager: NSObject {
     private var alertPermissionsChecker: AlertPermissionsChecker!
     private var supportManager: SupportManager!
     private var settingsManager: SettingsManager!
+    private var loggingServicesManager = LoggingServicesManager()
+    private var analyticsServicesManager = AnalyticsServicesManager()
+
     private var overrideHistory = UserDefaults.appGroup?.overrideHistory ?? TemporaryScheduleOverrideHistory.init()
 
     private var state: State = .initialize
@@ -99,10 +108,13 @@ class LoopAppManager: NSObject {
 
         if FeatureFlags.remoteOverridesEnabled {
             DispatchQueue.main.async {
+#if targetEnvironment(simulator)
+                self.remoteNotificationRegistrationDidFinish(.failure(SimulatorError.remoteNotificationsNotAvailable))
+#else
                 UIApplication.shared.registerForRemoteNotifications()
+#endif
             }
         }
-
         self.state = state.next
     }
 
@@ -155,32 +167,42 @@ class LoopAppManager: NSObject {
         let localCacheDuration = Bundle.main.localCacheDuration
         let cacheStore = PersistenceController.controllerInAppGroupDirectory()
 
-        self.pluginManager = PluginManager()
-        self.bluetoothStateManager = BluetoothStateManager()
-        self.alertManager = AlertManager(alertPresenter: self,
-                                         userNotificationAlertScheduler: UserNotificationAlertScheduler(userNotificationCenter: UNUserNotificationCenter.current()),
-                                         expireAfter: Bundle.main.localCacheDuration,
-                                         bluetoothProvider: bluetoothStateManager)
+        pluginManager = PluginManager()
 
-        self.alertPermissionsChecker = AlertPermissionsChecker()
-        self.alertPermissionsChecker.delegate = alertManager
+        for support in pluginManager.availableSupports {
+            if let analyticsService = support as? AnalyticsService {
+                analyticsServicesManager.addService(analyticsService)
+            }
+        }
+
+        bluetoothStateManager = BluetoothStateManager()
+        alertManager = AlertManager(alertPresenter: self,
+                                    userNotificationAlertScheduler: UserNotificationAlertScheduler(userNotificationCenter: UNUserNotificationCenter.current()),
+                                    expireAfter: Bundle.main.localCacheDuration,
+                                    bluetoothProvider: bluetoothStateManager,
+                                    analyticsServicesManager: analyticsServicesManager)
+
+        alertPermissionsChecker = AlertPermissionsChecker()
+        alertPermissionsChecker.delegate = alertManager
         
-        self.trustedTimeChecker = TrustedTimeChecker(alertManager: alertManager)
+        trustedTimeChecker = TrustedTimeChecker(alertManager: alertManager)
 
-        self.settingsManager = SettingsManager(cacheStore: cacheStore,
+        settingsManager = SettingsManager(cacheStore: cacheStore,
                                                expireAfter: localCacheDuration,
                                                alertMuter: alertManager.alertMuter)
 
-        self.deviceDataManager = DeviceDataManager(pluginManager: pluginManager,
-                                                   alertManager: alertManager,
-                                                   settingsManager: settingsManager,
-                                                   bluetoothProvider: bluetoothStateManager,
-                                                   alertPresenter: self,
-                                                   closedLoopStatus: closedLoopStatus,
-                                                   cacheStore: cacheStore,
-                                                   localCacheDuration: localCacheDuration,
-                                                   overrideHistory: overrideHistory,
-                                                   trustedTimeChecker: trustedTimeChecker
+        deviceDataManager = DeviceDataManager(pluginManager: pluginManager,
+                                              alertManager: alertManager,
+                                              settingsManager: settingsManager,
+                                              loggingServicesManager: loggingServicesManager,
+                                              analyticsServicesManager: analyticsServicesManager,
+                                              bluetoothProvider: bluetoothStateManager,
+                                              alertPresenter: self,
+                                              closedLoopStatus: closedLoopStatus,
+                                              cacheStore: cacheStore,
+                                              localCacheDuration: localCacheDuration,
+                                              overrideHistory: overrideHistory,
+                                              trustedTimeChecker: trustedTimeChecker
         )
         settingsManager.deviceStatusProvider = deviceDataManager
         settingsManager.displayGlucoseUnitObservable = deviceDataManager.displayGlucoseUnitObservable
@@ -188,20 +210,27 @@ class LoopAppManager: NSObject {
 
         overrideHistory.delegate = self
 
-        SharedLogging.instance = deviceDataManager.loggingServicesManager
+        SharedLogging.instance = loggingServicesManager
 
         scheduleBackgroundTasks()
 
-        self.onboardingManager = OnboardingManager(pluginManager: pluginManager,
-                                                   bluetoothProvider: bluetoothStateManager,
-                                                   deviceDataManager: deviceDataManager,
-                                                   servicesManager: deviceDataManager.servicesManager,
-                                                   loopDataManager: deviceDataManager.loopManager,
-                                                   windowProvider: windowProvider,
-                                                   userDefaults: UserDefaults.appGroup!)
+        onboardingManager = OnboardingManager(pluginManager: pluginManager,
+                                              bluetoothProvider: bluetoothStateManager,
+                                              deviceDataManager: deviceDataManager,
+                                              servicesManager: deviceDataManager.servicesManager,
+                                              loopDataManager: deviceDataManager.loopManager,
+                                              windowProvider: windowProvider,
+                                              userDefaults: UserDefaults.appGroup!)
 
         deviceDataManager.onboardingManager = onboardingManager
-        deviceDataManager.analyticsServicesManager.application(didFinishLaunchingWithOptions: launchOptions)
+
+        analyticsServicesManager.identifyAppName(Bundle.main.bundleDisplayName)
+
+        if let workspaceGitRevision = Bundle.main.workspaceGitRevision {
+            analyticsServicesManager.identifyWorkspaceGitRevision(workspaceGitRevision)
+        }
+
+        analyticsServicesManager.application(didFinishLaunchingWithOptions: launchOptions)
 
         supportManager = SupportManager(pluginManager: pluginManager,
                                         deviceDataManager: deviceDataManager,
@@ -214,7 +243,7 @@ class LoopAppManager: NSObject {
             .assign(to: \.closedLoopStatus.isClosedLoop, on: self)
             .store(in: &cancellables)
 
-        self.state = state.next
+        state = state.next
     }
 
     private func launchOnboarding() {

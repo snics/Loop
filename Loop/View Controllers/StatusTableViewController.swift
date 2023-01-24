@@ -1278,6 +1278,7 @@ final class StatusTableViewController: LoopChartsTableViewController {
             navigationWrapper = UINavigationController(rootViewController: carbEntryViewController)
         }
         present(navigationWrapper, animated: true)
+        deviceManager.analyticsServicesManager.didDisplayCarbEntryScreen()
     }
 
     @IBAction func presentBolusScreen() {
@@ -1292,13 +1293,17 @@ final class StatusTableViewController: LoopChartsTableViewController {
             hostingController = DismissibleHostingController(rootView: bolusEntryView, isModalInPresentation: false)
         } else {
             let viewModel = BolusEntryViewModel(delegate: deviceManager, screenWidth: UIScreen.main.bounds.width, isManualGlucoseEntryEnabled: enableManualGlucoseEntry)
-            viewModel.generateRecommendationAndStartObserving()
+            Task { @MainActor in
+                await viewModel.generateRecommendationAndStartObserving()
+            }
+            viewModel.analyticsServicesManager = deviceManager.analyticsServicesManager
             let bolusEntryView = BolusEntryView(viewModel: viewModel).environmentObject(deviceManager.displayGlucoseUnitObservable)
             hostingController = DismissibleHostingController(rootView: bolusEntryView, isModalInPresentation: false)
         }
         let navigationWrapper = UINavigationController(rootViewController: hostingController)
         hostingController.navigationItem.leftBarButtonItem = UIBarButtonItem(barButtonSystemItem: .cancel, target: navigationWrapper, action: #selector(dismissWithAnimation))
         present(navigationWrapper, animated: true)
+        deviceManager.analyticsServicesManager.didDisplayBolusScreen()
     }
 
     private func createPreMealButtonItem(selected: Bool, isEnabled: Bool) -> UIBarButtonItem {
